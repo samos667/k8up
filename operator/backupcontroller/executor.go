@@ -137,12 +137,14 @@ func (b *BackupExecutor) listAndFilterPVCs(ctx context.Context, annotation strin
 			log.V(1).Info("PVC mounted at pod", "pvc", pvc.GetName(), "targetPod", bi.targetPod, "node", bi.node, "tolerations", bi.tolerations)
 		} else if isRWO {
 			pv := &corev1.PersistentVolume{}
+			nodeList := &corev1.NodeList{}
+
 			if err := b.Config.Client.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
 				log.Error(err, "unable to get PV, skipping pvc", "pvc", pvc.GetName(), "pv", pvc.Spec.VolumeName)
 				continue
 			}
 
-			bi.node = findNode(pv, pvc)
+			bi.node = findNode(pv, pvc, nodeList.Items)
 			if bi.node == "" {
 				log.Info("RWO PVC not bound and no PV node affinity set, adding", "pvc", pvc.GetName(), "affinity", pv.Spec.NodeAffinity)
 			}
@@ -157,19 +159,63 @@ func (b *BackupExecutor) listAndFilterPVCs(ctx context.Context, annotation strin
 	return backupItems, nil
 }
 
-// findNode tries to find a PVs NodeAffinity for a specific hostname. If found will return that.
-// If not it will try to return the value of the k8up.io/hostname annotation on the PVC. If this is not set, will return
-// empty string.
-func findNode(pv *corev1.PersistentVolume, pvc corev1.PersistentVolumeClaim) string {
+func stringInSlice(s string, slice []string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeSelectorRequirementMatches(node *corev1.Node, req corev1.NodeSelectorRequirement) bool {
+	nodeValue, exists := node.Labels[req.Key]
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn:
+		return exists && stringInSlice(nodeValue, req.Values)
+	case corev1.NodeSelectorOpNotIn:
+		return !exists || !stringInSlice(nodeValue, req.Values)
+	case corev1.NodeSelectorOpExists:
+		return exists
+	case corev1.NodeSelectorOpDoesNotExist:
+		return !exists
+	case corev1.NodeSelectorOpGt, corev1.NodeSelectorOpLt:
+		return false
+	default:
+		return false
+	}
+}
+
+func nodeSelectorTermMatches(node *corev1.Node, term corev1.NodeSelectorTerm) bool {
+	for _, expr := range term.MatchExpressions {
+		if !nodeSelectorRequirementMatches(node, expr) {
+			return false
+		}
+	}
+	return true
+}
+
+// Return if node match NodeAffinity of PVs
+func nodeMatchesAffinity(node *corev1.Node, nodeSelector *corev1.NodeSelector) bool {
+	for _, term := range nodeSelector.NodeSelectorTerms {
+		if nodeSelectorTermMatches(node, term) {
+			return true
+		}
+	}
+	return false
+}
+
+// findNode list PV NodeAffinity(s) and return the first node that match.
+// If no one match it will try to return the value of the k8up.io/hostname annotation on the PVC.
+// If this is not set, will return empty string.
+func findNode(pv *corev1.PersistentVolume, pvc corev1.PersistentVolumeClaim, nodes []corev1.Node) string {
 	hostnameAnnotation := pvc.Annotations[k8upv1.AnnotationK8upHostname]
 	if pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
 		return hostnameAnnotation
 	}
-	for _, term := range pv.Spec.NodeAffinity.Required.NodeSelectorTerms {
-		for _, matchExpr := range term.MatchExpressions {
-			if matchExpr.Key == corev1.LabelHostname && matchExpr.Operator == corev1.NodeSelectorOpIn {
-				return matchExpr.Values[0]
-			}
+	for _, node := range nodes {
+		if nodeMatchesAffinity(&node, pv.Spec.NodeAffinity.Required) {
+			return node.GetName()
 		}
 	}
 	return hostnameAnnotation
